@@ -24,15 +24,22 @@
 <section>
   <h2>Participants</h2>
   <table>
-    <tr><th>Name</th><th>Link claimed</th><th>Match opened</th></tr>
+    <tr><th>Name</th><th>Link claimed</th><th>Match opened</th><th></th></tr>
     {% for p in people %}
     <tr>
       <td>{{ p.name }}</td>
       <td>{{ "yes" if p.claimed else "no" }}</td>
       <td>{{ "yes" if p.revealed else "no" }}</td>
+      <td>
+        {% if p.claimed and not event.drawn %}
+        <form method="post" action="/admin/events/{{ event.id }}/participants/{{ p.id }}/unclaim" class="inline" onsubmit="return confirm('Unclaim this person? Their current link will stop working.');">
+          <button type="submit" class="link">Unclaim</button>
+        </form>
+        {% endif %}
+      </td>
     </tr>
     {% else %}
-    <tr><td colspan="3">No participants yet.</td></tr>
+    <tr><td colspan="4">No participants yet.</td></tr>
     {% endfor %}
   </table>
 </section>

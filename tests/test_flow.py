@@ -417,3 +417,40 @@ def test_impossible_couples_block_the_draw(client, db_path):
     assert "fewer than two valid partners" in resp.text
     assert query(db_path, "SELECT drawn FROM event WHERE id = ?", (event_id,))[0]["drawn"] == 0
     assert query(db_path, "SELECT COUNT(*) AS n FROM assignment")[0]["n"] == 0
+
+
+def test_admin_can_unclaim_one_person(client, db_path):
+    admin_login(client)
+    event_id, tokens = setup_full_event(client, db_path)
+    ann = person_id(db_path, event_id, "Ann")
+
+    resp = client.post(f"/admin/events/{event_id}/participants/{ann}/unclaim")
+    assert resp.status_code == 303
+
+    assert client.get(f"/r/{tokens['Ann']}").status_code == 404  # old link is dead
+    assert "3 of 4" in client.get(f"/admin/events/{event_id}").text
+    assert "<strong>" not in client.get(f"/r/{tokens['Ben']}").text  # others unaffected, draw not run
+
+    new_token = claim(client, db_path, event_id, "Ann")
+    assert new_token != tokens["Ann"]
+    assert client.get(f"/r/{new_token}").status_code == 200
+
+
+def test_unclaim_closed_after_draw(client, db_path):
+    admin_login(client)
+    event_id, tokens = setup_full_event(client, db_path)
+    draw(client, event_id)
+    ann = person_id(db_path, event_id, "Ann")
+
+    resp = client.post(f"/admin/events/{event_id}/participants/{ann}/unclaim")
+    assert resp.status_code == 400
+    assert "already happened" in resp.text
+    assert "<strong>" in client.get(f"/r/{tokens['Ann']}").text  # Ann's link still works
+
+
+def test_unclaim_unknown_person_is_rejected(client, db_path):
+    admin_login(client)
+    event_id, _ = setup_full_event(client, db_path)
+    resp = client.post(f"/admin/events/{event_id}/participants/999/unclaim")
+    assert resp.status_code == 400
+    assert "unclaim that person" in resp.text  # apostrophe is HTML-escaped in the page

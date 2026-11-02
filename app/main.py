@@ -299,6 +299,31 @@ def add_participant(
     return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
 
 
+@router.post(
+    "/admin/events/{event_id}/participants/{person_id}/unclaim",
+    dependencies=[Depends(require_admin)],
+)
+def unclaim_participant(
+    event_id: int,
+    person_id: int,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    # Their old link stops working. They can claim their name again for a new one.
+    event = get_event_or_404(conn, event_id)
+    if event["drawn"]:
+        return render_admin_event(request, conn, event_id, "The draw has already happened.", 400)
+    cur = conn.execute(
+        "UPDATE participant SET token_hash = NULL, public_key = NULL, claimed_at = NULL "
+        "WHERE id = ? AND event_id = ? "
+        "AND (SELECT drawn FROM event WHERE id = ?) = 0",
+        (person_id, event_id, event_id),
+    )
+    if cur.rowcount == 0:
+        return render_admin_event(request, conn, event_id, "Couldn't unclaim that person.", 400)
+    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
+
+
 def _draw(conn: sqlite3.Connection, event_id: int) -> str | None:
     """Run the draw inside an open transaction. Returns an error message or None.
     Pairs exist only in this function's memory; only ciphertext is written."""
