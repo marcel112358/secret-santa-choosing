@@ -318,3 +318,102 @@ def test_unknown_event_is_404(client):
     admin_login(client)
     assert client.get("/admin/events/999").status_code == 404
     assert client.post("/admin/events/999/draw").status_code == 404
+
+
+def person_id(db_path, event_id, name):
+    rows = query(
+        db_path,
+        "SELECT id FROM participant WHERE event_id = ? AND name = ?",
+        (event_id, name),
+    )
+    return rows[0]["id"]
+
+
+def add_couple(client, event_id, a_id, b_id):
+    return client.post(
+        f"/admin/events/{event_id}/couples", data={"person_a": a_id, "person_b": b_id}
+    )
+
+
+def reveal_receiver(client, token):
+    match = re.search(r"<strong>(\w+)</strong>", client.get(f"/r/{token}").text)
+    return match.group(1)
+
+
+def test_couples_never_draw_each_other(client, db_path):
+    admin_login(client)
+    event_id = create_event(client)
+    add_names(client, event_id, NAMES)
+    tokens = {n: claim(client, db_path, event_id, n) for n in NAMES}
+    ann, ben, cy, dee = (person_id(db_path, event_id, n) for n in NAMES)
+    assert add_couple(client, event_id, ann, ben).status_code == 303
+    assert add_couple(client, event_id, cy, dee).status_code == 303
+
+    assert draw(client, event_id).status_code == 303
+
+    receivers = {n: reveal_receiver(client, tokens[n]) for n in NAMES}
+    assert receivers["Ann"] != "Ben" and receivers["Ben"] != "Ann"
+    assert receivers["Cy"] != "Dee" and receivers["Dee"] != "Cy"
+
+
+def test_couple_validation(client, db_path):
+    admin_login(client)
+    event_id = create_event(client, "Family")
+    other_id = create_event(client, "Work")
+    add_names(client, event_id, NAMES)
+    add_names(client, other_id, ["Zoe"])
+    ann, ben = person_id(db_path, event_id, "Ann"), person_id(db_path, event_id, "Ben")
+    zoe = person_id(db_path, other_id, "Zoe")
+
+    assert add_couple(client, event_id, ann, ann).status_code == 400
+    assert add_couple(client, event_id, ann, zoe).status_code == 400  # other event
+    assert add_couple(client, event_id, ann, ben).status_code == 303
+    resp = add_couple(client, event_id, ben, ann)  # same couple, reversed
+    assert resp.status_code == 400
+    assert "already set" in resp.text
+
+
+def test_couple_removal(client, db_path):
+    admin_login(client)
+    event_id = create_event(client)
+    add_names(client, event_id, NAMES)
+    ann, ben = person_id(db_path, event_id, "Ann"), person_id(db_path, event_id, "Ben")
+    add_couple(client, event_id, ann, ben)
+
+    client.post(
+        f"/admin/events/{event_id}/couples/remove",
+        data={"person_a": ben, "person_b": ann},
+    )
+
+    assert query(db_path, "SELECT COUNT(*) AS n FROM exclusion")[0]["n"] == 0
+
+
+def test_couples_cannot_change_after_draw(client, db_path):
+    admin_login(client)
+    event_id, _ = setup_full_event(client, db_path)
+    draw(client, event_id)
+    ann, ben = person_id(db_path, event_id, "Ann"), person_id(db_path, event_id, "Ben")
+
+    resp = add_couple(client, event_id, ann, ben)
+    assert resp.status_code == 400
+    assert "already happened" in resp.text
+
+
+def test_impossible_couples_block_the_draw(client, db_path):
+    admin_login(client)
+    event_id = create_event(client)
+    add_names(client, event_id, ["Ann", "Ben", "Cy"])
+    for name in ["Ann", "Ben", "Cy"]:
+        claim(client, db_path, event_id, name)
+    add_couple(
+        client,
+        event_id,
+        person_id(db_path, event_id, "Ann"),
+        person_id(db_path, event_id, "Ben"),
+    )
+
+    resp = draw(client, event_id)
+    assert resp.status_code == 400
+    assert "fewer than two valid partners" in resp.text
+    assert query(db_path, "SELECT drawn FROM event WHERE id = ?", (event_id,))[0]["drawn"] == 0
+    assert query(db_path, "SELECT COUNT(*) AS n FROM assignment")[0]["n"] == 0

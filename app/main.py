@@ -14,7 +14,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app import db
 from app.crypto import lookup_hash, new_token, open_with, public_key_for, seal_for
-from app.draw import make_cycle
+from app.draw import DrawError, make_cycle
 
 BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=BASE / "templates")
@@ -92,8 +92,16 @@ def render_admin_event(
     event = get_event_or_404(conn, event_id)
     # Only status columns are selected: no tokens, keys, or assignments.
     people = conn.execute(
-        "SELECT name, token_hash IS NOT NULL AS claimed, revealed_at IS NOT NULL AS revealed "
+        "SELECT id, name, token_hash IS NOT NULL AS claimed, revealed_at IS NOT NULL AS revealed "
         "FROM participant WHERE event_id = ? ORDER BY name COLLATE NOCASE",
+        (event_id,),
+    ).fetchall()
+    couples = conn.execute(
+        "SELECT a.id AS a_id, a.name AS a_name, b.id AS b_id, b.name AS b_name "
+        "FROM exclusion x "
+        "JOIN participant a ON a.id = x.person_a "
+        "JOIN participant b ON b.id = x.person_b "
+        "WHERE x.event_id = ? ORDER BY a.name COLLATE NOCASE",
         (event_id,),
     ).fetchall()
     total = len(people)
@@ -107,6 +115,7 @@ def render_admin_event(
             "event": event,
             "join_link": request.url_for("join", code=event["code"]),
             "people": people,
+            "couples": couples,
             "total": total,
             "claimed": claimed,
             "can_draw": can_draw,
@@ -305,7 +314,14 @@ def _draw(conn: sqlite3.Connection, event_id: int) -> str | None:
     if any(person["token_hash"] is None for person in people):
         return "Everyone must claim their link before the draw."
 
-    pairs = make_cycle([person["id"] for person in people])
+    couples = conn.execute(
+        "SELECT person_a, person_b FROM exclusion WHERE event_id = ?", (event_id,)
+    ).fetchall()
+    forbidden = {frozenset((c["person_a"], c["person_b"])) for c in couples}
+    try:
+        pairs = make_cycle([person["id"] for person in people], forbidden)
+    except DrawError as exc:
+        return str(exc)
     keys = {person["id"]: person["public_key"] for person in people}
     for giver, receiver in pairs.items():
         conn.execute(
@@ -314,6 +330,56 @@ def _draw(conn: sqlite3.Connection, event_id: int) -> str | None:
         )
     conn.execute("UPDATE event SET drawn = 1 WHERE id = ?", (event_id,))
     return None
+
+
+def _members(conn: sqlite3.Connection, event_id: int) -> set[int]:
+    rows = conn.execute("SELECT id FROM participant WHERE event_id = ?", (event_id,))
+    return {row["id"] for row in rows}
+
+
+@router.post("/admin/events/{event_id}/couples", dependencies=[Depends(require_admin)])
+def add_couple(
+    event_id: int,
+    request: Request,
+    person_a: int = Form(...),
+    person_b: int = Form(...),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    event = get_event_or_404(conn, event_id)
+    if event["drawn"]:
+        return render_admin_event(request, conn, event_id, "The draw has already happened.", 400)
+    if person_a == person_b:
+        return render_admin_event(request, conn, event_id, "Pick two different people.", 400)
+    if not {person_a, person_b} <= _members(conn, event_id):
+        return render_admin_event(request, conn, event_id, "Unknown participant.", 400)
+    low, high = sorted((person_a, person_b))
+    try:
+        conn.execute(
+            "INSERT INTO exclusion (event_id, person_a, person_b) VALUES (?, ?, ?)",
+            (event_id, low, high),
+        )
+    except sqlite3.IntegrityError:
+        return render_admin_event(request, conn, event_id, "That couple is already set.", 400)
+    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
+
+
+@router.post("/admin/events/{event_id}/couples/remove", dependencies=[Depends(require_admin)])
+def remove_couple(
+    event_id: int,
+    request: Request,
+    person_a: int = Form(...),
+    person_b: int = Form(...),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    event = get_event_or_404(conn, event_id)
+    if event["drawn"]:
+        return render_admin_event(request, conn, event_id, "The draw has already happened.", 400)
+    low, high = sorted((person_a, person_b))
+    conn.execute(
+        "DELETE FROM exclusion WHERE event_id = ? AND person_a = ? AND person_b = ?",
+        (event_id, low, high),
+    )
+    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
 
 
 @router.post("/admin/events/{event_id}/draw", dependencies=[Depends(require_admin)])

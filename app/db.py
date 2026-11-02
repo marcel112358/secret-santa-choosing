@@ -25,6 +25,15 @@ SCHEMA = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS exclusion (
+        event_id INTEGER NOT NULL REFERENCES event(id) ON DELETE CASCADE,
+        person_a INTEGER NOT NULL REFERENCES participant(id) ON DELETE CASCADE,
+        person_b INTEGER NOT NULL REFERENCES participant(id) ON DELETE CASCADE,
+        PRIMARY KEY (event_id, person_a, person_b),
+        CHECK (person_a < person_b)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS assignment (
         giver_id INTEGER PRIMARY KEY REFERENCES participant(id) ON DELETE CASCADE,
         ciphertext BLOB NOT NULL

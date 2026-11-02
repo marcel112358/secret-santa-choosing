@@ -56,6 +56,43 @@
 {% endif %}
 
 <section>
+  <h2>Couples</h2>
+  <p class="muted">People in a couple won't draw each other, in either direction.</p>
+  {% if couples %}
+  <table>
+    {% for c in couples %}
+    <tr>
+      <td>{{ c.a_name }} &amp; {{ c.b_name }}</td>
+      <td>
+        {% if not event.drawn %}
+        <form method="post" action="/admin/events/{{ event.id }}/couples/remove" class="inline">
+          <input type="hidden" name="person_a" value="{{ c.a_id }}">
+          <input type="hidden" name="person_b" value="{{ c.b_id }}">
+          <button type="submit" class="link">Remove</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">No couples set.</p>
+  {% endif %}
+
+  {% if not event.drawn and people|length >= 2 %}
+  <form method="post" action="/admin/events/{{ event.id }}/couples" class="inline-form">
+    <select name="person_a" required>
+      {% for p in people %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}
+    </select>
+    <select name="person_b" required>
+      {% for p in people %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}
+    </select>
+    <button type="submit">Add couple</button>
+  </form>
+  {% endif %}
+</section>
+
+<section>
   <h2>Reset</h2>
   <p class="muted">Deletes this event's draw and every claimed link. Everyone must claim again.</p>
   <form method="post" action="/admin/events/{{ event.id }}/reset" onsubmit="return confirm('Delete the draw and all links for this event?');">

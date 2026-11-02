@@ -59,7 +59,16 @@ button.danger { background: #555; }
 
 .inline { display: inline; }
 .inline-form { display: flex; gap: 0.5rem; }
-.inline-form input { margin-top: 0; }
+.inline-form input,
+.inline-form select { margin-top: 0; }
+
+select {
+  font: inherit;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
 
 .error { color: var(--accent); font-weight: 600; }
 .warning { background: #fff4e5; padding: 0.7rem; border-radius: 8px; }
