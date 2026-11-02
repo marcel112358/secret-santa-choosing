@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<p>Have an event link? Open it directly. Otherwise, enter the event code and your name.</p>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/claim">
+  <label>
+    Event code
+    <input name="code" required autocomplete="off">
+  </label>
+  <label>
+    Your name
+    <input name="name" required autocomplete="off">
+  </label>
+  <button type="submit">Get my link</button>
+</form>
+
+<p class="muted"><a href="/admin/login">Admin</a></p>
+{% endblock %}

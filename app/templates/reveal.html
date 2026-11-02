@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<p>Hi {{ name }}! <span class="muted">({{ event_name }})</span></p>
+
+{% if receiver %}
+  <p class="reveal">You are the Secret Santa for<br><strong>{{ receiver }}</strong></p>
+  <p class="muted">Keep this to yourself. Reload this page any time to see it again.</p>
+{% else %}
+  <p>The draw hasn't happened yet. Come back to this link after the admin runs it.</p>
+{% endif %}
+{% endblock %}

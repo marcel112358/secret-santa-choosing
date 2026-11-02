@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Test and tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data: the SQLite database holds live event data and must never be committed
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store

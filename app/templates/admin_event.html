@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}{{ event.name }} · Secret Santa{% endblock %}
+{% block content %}
+<p class="muted">
+  <a href="/admin">All events</a> ·
+  <form method="post" action="/admin/logout" class="inline"><button class="link">Log out</button></form>
+</p>
+
+<h2>{{ event.name }}</h2>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<section>
+  <h2>Invite link</h2>
+  <p class="muted">Send this link to participants. It opens the join page with the event code already filled in.</p>
+  <input class="copy" readonly value="{{ join_link }}" onclick="this.select()">
+  <p class="muted">Event code: <code>{{ event.code }}</code></p>
+  <p>{{ claimed }} of {{ total }} participants have claimed their link.</p>
+  {% if event.drawn %}
+    <p>The draw is done. Matches are only visible to each giver through their own link.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Participants</h2>
+  <table>
+    <tr><th>Name</th><th>Link claimed</th><th>Match opened</th></tr>
+    {% for p in people %}
+    <tr>
+      <td>{{ p.name }}</td>
+      <td>{{ "yes" if p.claimed else "no" }}</td>
+      <td>{{ "yes" if p.revealed else "no" }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="3">No participants yet.</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+{% if not event.drawn %}
+<section>
+  <h2>Add participant</h2>
+  <form method="post" action="/admin/events/{{ event.id }}/participants" class="inline-form">
+    <input name="name" required maxlength="100" autocomplete="off" placeholder="Name">
+    <button type="submit">Add</button>
+  </form>
+</section>
+
+<section>
+  <h2>Draw</h2>
+  <p class="muted">Needs at least {{ min_participants }} participants, and everyone must claim their link first.</p>
+  <form method="post" action="/admin/events/{{ event.id }}/draw">
+    <button type="submit" {% if not can_draw %}disabled{% endif %}>Run the draw</button>
+  </form>
+</section>
+{% endif %}
+
+<section>
+  <h2>Reset</h2>
+  <p class="muted">Deletes this event's draw and every claimed link. Everyone must claim again.</p>
+  <form method="post" action="/admin/events/{{ event.id }}/reset" onsubmit="return confirm('Delete the draw and all links for this event?');">
+    <button type="submit" class="danger">Reset this event</button>
+  </form>
+</section>
+{% endblock %}

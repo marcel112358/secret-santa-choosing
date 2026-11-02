@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<p>Hi {{ name }}, you're in for <strong>{{ event_name }}</strong>.</p>
+
+<p class="warning"><strong>Save this link now.</strong> It is shown only once, and it is the only way to see your match. Don't share it.</p>
+
+<p class="link"><a href="{{ link }}">{{ link }}</a></p>
+
+<p class="muted">The draw happens later. Come back to this link after the admin runs it.</p>
+{% endblock %}
