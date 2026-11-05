@@ -9,7 +9,8 @@ SCHEMA = [
         name TEXT NOT NULL,
         code TEXT NOT NULL UNIQUE,
         drawn INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        creator_token_hash TEXT
     )
     """,
     """
@@ -41,6 +42,11 @@ SCHEMA = [
     """,
 ]
 
+# Created after _ensure_column, because existing databases get the column added late.
+INDEXES = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS event_creator_hash ON event(creator_token_hash)",
+]
+
 
 def connect(path: str) -> sqlite3.Connection:
     # Autocommit mode; transactions are opened explicitly where needed.
@@ -61,8 +67,18 @@ def init_db(path: str) -> None:
             _migrate_single_event(conn)
         for statement in SCHEMA:
             conn.execute(statement)
+        # Multi-event databases created before creator links lack this column.
+        _ensure_column(conn, "event", "creator_token_hash", "TEXT")
+        for statement in INDEXES:
+            conn.execute(statement)
     finally:
         conn.close()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def _is_single_event_schema(conn: sqlite3.Connection) -> bool:

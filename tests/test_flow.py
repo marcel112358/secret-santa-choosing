@@ -4,12 +4,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import db
+from app.crypto import lookup_hash
+from app.limits import RateLimiter
 from app.main import create_app
 
 ADMIN_PASSWORD = "test-admin-pw"
 NAMES = ["Ann", "Ben", "Cy", "Dee"]
 LINK_RE = re.compile(r"/r/([A-Za-z0-9_-]+)")
-ID_RE = re.compile(r"/admin/events/(\d+)")
+MANAGE_RE = re.compile(r"/manage/([A-Za-z0-9_-]+)")
 
 
 @pytest.fixture
@@ -18,8 +20,12 @@ def db_path(tmp_path):
 
 
 @pytest.fixture
-def client(db_path):
-    app = create_app(db_path=db_path, admin_password=ADMIN_PASSWORD, secret_key="test")
+def app(db_path):
+    return create_app(db_path=db_path, admin_password=ADMIN_PASSWORD, secret_key="test")
+
+
+@pytest.fixture
+def client(app):
     return TestClient(app, follow_redirects=False)
 
 
@@ -35,20 +41,26 @@ def event_code(db_path, event_id):
     return query(db_path, "SELECT code FROM event WHERE id = ?", (event_id,))[0]["code"]
 
 
-def admin_login(client):
-    resp = client.post("/admin/login", data={"password": ADMIN_PASSWORD})
+def super_login(client):
+    resp = client.post("/super/login", data={"password": ADMIN_PASSWORD})
     assert resp.status_code == 303
 
 
-def create_event(client, name="Office Christmas"):
-    resp = client.post("/admin/events", data={"name": name})
+def create_event(client, db_path, name="Office Christmas"):
+    """Create an event the public way. Returns (event_id, creator_token)."""
+    resp = client.post("/events", data={"name": name})
     assert resp.status_code == 303, resp.text
-    return int(ID_RE.search(resp.headers["location"]).group(1))
+    token = MANAGE_RE.search(resp.headers["location"]).group(1)
+    # The database only keeps the hash, so the id is found through it.
+    event_id = query(
+        db_path, "SELECT id FROM event WHERE creator_token_hash = ?", (lookup_hash(token),)
+    )[0]["id"]
+    return event_id, token
 
 
-def add_names(client, event_id, names):
+def add_names(client, token, names):
     for name in names:
-        resp = client.post(f"/admin/events/{event_id}/participants", data={"name": name})
+        resp = client.post(f"/manage/{token}/participants", data={"name": name})
         assert resp.status_code == 303, resp.text
 
 
@@ -62,54 +74,114 @@ def claim(client, db_path, event_id, name):
     return match.group(1)
 
 
-def draw(client, event_id):
-    return client.post(f"/admin/events/{event_id}/draw")
+def draw(client, token):
+    return client.post(f"/manage/{token}/draw")
 
 
 def setup_full_event(client, db_path, name="Office Christmas", names=NAMES):
-    event_id = create_event(client, name)
-    add_names(client, event_id, names)
+    event_id, creator = create_event(client, db_path, name)
+    add_names(client, creator, names)
     tokens = {n: claim(client, db_path, event_id, n) for n in names}
-    return event_id, tokens
+    return event_id, creator, tokens
 
 
-def test_admin_pages_require_login(client):
-    assert client.get("/admin").headers["location"] == "/admin/login"
-    assert client.get("/admin/events/1").headers["location"] == "/admin/login"
-    assert client.post("/admin/events", data={"name": "x"}).status_code == 303
+def person_id(db_path, event_id, name):
+    rows = query(
+        db_path,
+        "SELECT id FROM participant WHERE event_id = ? AND name = ?",
+        (event_id, name),
+    )
+    return rows[0]["id"]
 
 
-def test_wrong_admin_password(client):
-    resp = client.post("/admin/login", data={"password": "nope"})
+def add_couple(client, token, a_id, b_id):
+    return client.post(f"/manage/{token}/couples", data={"person_a": a_id, "person_b": b_id})
+
+
+def reveal_receiver(client, token):
+    match = re.search(r"<strong>(\w+)</strong>", client.get(f"/r/{token}").text)
+    return match.group(1)
+
+
+def test_creator_pages_need_a_real_token(client):
+    assert client.get("/manage/not-a-real-token").status_code == 404
+    assert client.post("/manage/not-a-real-token/draw").status_code == 404
+    assert client.post("/manage/not-a-real-token/delete").status_code == 404
+
+
+def test_super_pages_require_login(client):
+    assert client.get("/super").headers["location"] == "/super/login"
+    assert client.post("/super/events/1/delete").headers["location"] == "/super/login"
+    assert client.post("/super/events/1/rotate-creator").headers["location"] == "/super/login"
+
+
+def test_creator_link_does_not_open_super_admin(client, db_path):
+    _, creator = create_event(client, db_path)
+    assert client.get("/super").headers["location"] == "/super/login"
+    assert client.get(f"/manage/{creator}").status_code == 200
+
+
+def test_wrong_super_password(client):
+    resp = client.post("/super/login", data={"password": "nope"})
     assert resp.status_code == 401
 
 
+def test_super_logout_ends_session(client):
+    super_login(client)
+    assert client.get("/super").status_code == 200
+    client.post("/super/logout")
+    assert client.get("/super").headers["location"] == "/super/login"
+
+
+def test_index_has_create_form(client):
+    html = client.get("/").text
+    assert 'action="/events"' in html
+    assert "/admin" not in html
+
+
 def test_create_event_requires_name(client):
-    admin_login(client)
-    resp = client.post("/admin/events", data={"name": "   "})
+    resp = client.post("/events", data={"name": "   "})
     assert resp.status_code == 400
     assert "1–100 characters" in resp.text
 
 
-def test_admin_home_lists_events(client):
-    admin_login(client)
-    create_event(client, "Family Gift Swap")
-    create_event(client, "Work Party")
-    html = client.get("/admin").text
-    assert "Family Gift Swap" in html
-    assert "Work Party" in html
+def test_create_event_opens_creator_page(client, db_path):
+    event_id, creator = create_event(client, db_path, "Family Gift Swap")
+    resp = client.get(f"/manage/{creator}")
+    assert resp.status_code == 200
+    assert "Family Gift Swap" in resp.text
+    assert "Keep this page's link private" in resp.text
 
 
-def test_invite_link_is_on_event_page(client, db_path):
-    admin_login(client)
-    event_id = create_event(client)
-    html = client.get(f"/admin/events/{event_id}").text
+def test_creator_page_shows_invite_link(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    html = client.get(f"/manage/{creator}").text
     assert f"/join/{event_code(db_path, event_id)}" in html
 
 
+def test_super_lists_all_events_with_detail(client, db_path):
+    _, first = create_event(client, db_path, "Family Gift Swap")
+    _, second = create_event(client, db_path, "Work Party")
+    super_login(client)
+    html = client.get("/super").text
+    assert "Family Gift Swap" in html
+    assert "Work Party" in html
+    assert "0 / 0 claimed" in html
+
+
+def test_super_sees_participant_names_but_no_tokens(client, db_path):
+    event_id, creator, tokens = setup_full_event(client, db_path)
+    super_login(client)
+    html = client.get("/super").text
+    assert "Ann" in html
+    assert "0 / 4 claimed" not in html  # all four claimed
+    assert "4 / 4 claimed" in html
+    assert all(token not in html for token in tokens.values())
+    assert creator not in html
+
+
 def test_join_page_shows_event_name_and_form(client, db_path):
-    admin_login(client)
-    event_id = create_event(client, "Office Christmas")
+    event_id, _ = create_event(client, db_path, "Office Christmas")
     code = event_code(db_path, event_id)
 
     resp = client.get(f"/join/{code}")
@@ -123,19 +195,17 @@ def test_join_unknown_code_is_404(client):
 
 
 def test_join_after_draw_says_closed(client, db_path):
-    admin_login(client)
-    event_id, _ = setup_full_event(client, db_path)
-    draw(client, event_id)
+    event_id, creator, _ = setup_full_event(client, db_path)
+    draw(client, creator)
     resp = client.get(f"/join/{event_code(db_path, event_id)}")
     assert "already happened" in resp.text
     assert "<form" not in resp.text
 
 
 def test_full_flow(client, db_path):
-    admin_login(client)
-    event_id, tokens = setup_full_event(client, db_path)
+    event_id, creator, tokens = setup_full_event(client, db_path)
 
-    assert draw(client, event_id).status_code == 303
+    assert draw(client, creator).status_code == 303
 
     receivers = {}
     for name, token in tokens.items():
@@ -151,27 +221,40 @@ def test_full_flow(client, db_path):
 
 
 def test_events_are_independent(client, db_path):
-    admin_login(client)
-    first, first_tokens = setup_full_event(client, db_path, "Family")
-    second, second_tokens = setup_full_event(client, db_path, "Work")
+    first, first_creator, first_tokens = setup_full_event(client, db_path, "Family")
+    second, second_creator, second_tokens = setup_full_event(client, db_path, "Work")
 
     # Same names in both events, each with its own link.
     assert first_tokens.keys() == second_tokens.keys()
     assert set(first_tokens.values()).isdisjoint(second_tokens.values())
 
-    draw(client, first)
+    draw(client, first_creator)
     # Drawing one event doesn't touch the other.
     assert "<strong>" in client.get(f"/r/{first_tokens['Ann']}").text
     assert "The draw hasn't happened yet" in client.get(f"/r/{second_tokens['Ann']}").text
     assert query(db_path, "SELECT drawn FROM event WHERE id = ?", (second,))[0]["drawn"] == 0
 
 
+def test_creator_token_only_reaches_its_own_event(client, db_path):
+    first, first_creator = create_event(client, db_path, "Family")
+    second, second_creator = create_event(client, db_path, "Work")
+    add_names(client, first_creator, NAMES)
+    add_names(client, second_creator, ["Zoe", "Yan", "Xi"])
+    ann = person_id(db_path, first, "Ann")
+    zoe = person_id(db_path, second, "Zoe")
+
+    # The first creator can't couple or unclaim someone from the second event.
+    assert add_couple(client, first_creator, ann, zoe).status_code == 400
+    resp = client.post(f"/manage/{first_creator}/participants/{zoe}/unclaim")
+    assert resp.status_code == 400
+    assert "Zoe" not in client.get(f"/manage/{first_creator}").text
+
+
 def test_claim_code_is_scoped_to_its_event(client, db_path):
-    admin_login(client)
-    first = create_event(client, "Family")
-    second = create_event(client, "Work")
-    add_names(client, first, ["Ann", "Ben", "Cy"])
-    add_names(client, second, ["Zoe", "Yan", "Xi"])
+    first, first_creator = create_event(client, db_path, "Family")
+    second, second_creator = create_event(client, db_path, "Work")
+    add_names(client, first_creator, ["Ann", "Ben", "Cy"])
+    add_names(client, second_creator, ["Zoe", "Yan", "Xi"])
 
     # "Zoe" exists in the second event only, so the first event's code must reject her.
     resp = client.post(
@@ -182,50 +265,45 @@ def test_claim_code_is_scoped_to_its_event(client, db_path):
 
 
 def test_same_name_can_exist_in_two_events(client, db_path):
-    admin_login(client)
-    first = create_event(client, "Family")
-    second = create_event(client, "Work")
-    add_names(client, first, ["Ann"])
-    add_names(client, second, ["Ann"])
+    _, first_creator = create_event(client, db_path, "Family")
+    _, second_creator = create_event(client, db_path, "Work")
+    add_names(client, first_creator, ["Ann"])
+    add_names(client, second_creator, ["Ann"])
     assert len(query(db_path, "SELECT id FROM participant WHERE name = 'Ann'")) == 2
 
 
 def test_duplicate_name_in_same_event_rejected(client, db_path):
-    admin_login(client)
-    event_id = create_event(client)
-    add_names(client, event_id, ["Ann"])
-    resp = client.post(f"/admin/events/{event_id}/participants", data={"name": "ann"})
+    _, creator = create_event(client, db_path)
+    add_names(client, creator, ["Ann"])
+    resp = client.post(f"/manage/{creator}/participants", data={"name": "ann"})
     assert resp.status_code == 400
     assert "already on this list" in resp.text
 
 
 def test_draw_blocked_until_everyone_claims(client, db_path):
-    admin_login(client)
-    event_id = create_event(client)
-    add_names(client, event_id, NAMES)
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, NAMES)
     claim(client, db_path, event_id, "Ann")
 
-    resp = draw(client, event_id)
+    resp = draw(client, creator)
     assert resp.status_code == 400
     assert "Everyone must claim" in resp.text
 
 
 def test_draw_needs_three_people(client, db_path):
-    admin_login(client)
-    event_id = create_event(client)
-    add_names(client, event_id, ["Ann", "Ben"])
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, ["Ann", "Ben"])
     claim(client, db_path, event_id, "Ann")
     claim(client, db_path, event_id, "Ben")
 
-    resp = draw(client, event_id)
+    resp = draw(client, creator)
     assert resp.status_code == 400
     assert "at least 3" in resp.text
 
 
 def test_claim_rules(client, db_path):
-    admin_login(client)
-    event_id = create_event(client)
-    add_names(client, event_id, NAMES)
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, NAMES)
 
     assert client.post("/claim", data={"code": "wrong", "name": "Ann"}).status_code == 400
     assert client.post(
@@ -240,29 +318,32 @@ def test_claim_rules(client, db_path):
     assert "already claimed" in resp.text
 
 
-def test_unknown_token_is_404(client):
+def test_unknown_reveal_token_is_404(client):
     assert client.get("/r/not-a-real-token").status_code == 404
 
 
-def test_no_pairing_is_visible_in_db_or_admin(client, db_path):
-    admin_login(client)
-    event_id, _ = setup_full_event(client, db_path)
-    draw(client, event_id)
+def test_no_pairing_is_visible_in_db_or_pages(client, db_path):
+    event_id, creator, tokens = setup_full_event(client, db_path)
+    draw(client, creator)
 
     blobs = [row["ciphertext"] for row in query(db_path, "SELECT ciphertext FROM assignment")]
     assert len(blobs) == len(NAMES)
     for blob in blobs:
         assert not any(name.encode() in blob for name in NAMES)
 
-    admin_html = client.get(f"/admin/events/{event_id}").text
-    assert "Match opened" in admin_html
-    assert "You are the Secret Santa" not in admin_html
+    creator_html = client.get(f"/manage/{creator}").text
+    assert "Match opened" in creator_html
+    assert "You are the Secret Santa" not in creator_html
+
+    super_login(client)
+    super_html = client.get("/super").text
+    assert "Match opened" in super_html
+    assert "You are the Secret Santa" not in super_html
 
 
 def test_opening_match_records_only_a_timestamp(client, db_path):
-    admin_login(client)
-    event_id, tokens = setup_full_event(client, db_path)
-    draw(client, event_id)
+    event_id, creator, tokens = setup_full_event(client, db_path)
+    draw(client, creator)
 
     client.get(f"/r/{tokens['Ann']}")
     ann = query(
@@ -273,11 +354,10 @@ def test_opening_match_records_only_a_timestamp(client, db_path):
 
 
 def test_draw_is_idempotent(client, db_path):
-    admin_login(client)
-    event_id, _ = setup_full_event(client, db_path)
+    event_id, creator, _ = setup_full_event(client, db_path)
 
-    draw(client, event_id)
-    resp = draw(client, event_id)
+    draw(client, creator)
+    resp = draw(client, creator)
     assert resp.status_code == 400
     assert "already happened" in resp.text
 
@@ -286,26 +366,25 @@ def test_draw_is_idempotent(client, db_path):
 
 
 def test_reset_only_affects_its_event(client, db_path):
-    admin_login(client)
-    first, first_tokens = setup_full_event(client, db_path, "Family")
-    second, second_tokens = setup_full_event(client, db_path, "Work")
-    draw(client, first)
-    draw(client, second)
+    first, first_creator, first_tokens = setup_full_event(client, db_path, "Family")
+    second, second_creator, second_tokens = setup_full_event(client, db_path, "Work")
+    draw(client, first_creator)
+    draw(client, second_creator)
 
-    client.post(f"/admin/events/{first}/reset")
+    client.post(f"/manage/{first_creator}/reset")
 
     assert client.get(f"/r/{first_tokens['Ann']}").status_code == 404
     assert "<strong>" in client.get(f"/r/{second_tokens['Ann']}").text
     assert query(db_path, "SELECT drawn FROM event WHERE id = ?", (second,))[0]["drawn"] == 1
-    admin_home = client.get("/admin").text
-    assert "0 / 4" in admin_home  # the reset event has no claims left
-    assert "4 / 4" in admin_home  # the other event keeps its claims
+    super_login(client)
+    super_html = client.get("/super").text
+    assert "0 / 4 claimed" in super_html  # the reset event has no claims left
+    assert "4 / 4 claimed" in super_html  # the other event keeps its claims
 
 
 def test_claim_closed_after_draw(client, db_path):
-    admin_login(client)
-    event_id, _ = setup_full_event(client, db_path)
-    draw(client, event_id)
+    event_id, creator, _ = setup_full_event(client, db_path)
+    draw(client, creator)
 
     resp = client.post(
         "/claim", data={"code": event_code(db_path, event_id), "name": "Ann"}
@@ -314,42 +393,20 @@ def test_claim_closed_after_draw(client, db_path):
     assert "already happened" in resp.text
 
 
-def test_unknown_event_is_404(client):
-    admin_login(client)
-    assert client.get("/admin/events/999").status_code == 404
-    assert client.post("/admin/events/999/draw").status_code == 404
-
-
-def person_id(db_path, event_id, name):
-    rows = query(
-        db_path,
-        "SELECT id FROM participant WHERE event_id = ? AND name = ?",
-        (event_id, name),
-    )
-    return rows[0]["id"]
-
-
-def add_couple(client, event_id, a_id, b_id):
-    return client.post(
-        f"/admin/events/{event_id}/couples", data={"person_a": a_id, "person_b": b_id}
-    )
-
-
-def reveal_receiver(client, token):
-    match = re.search(r"<strong>(\w+)</strong>", client.get(f"/r/{token}").text)
-    return match.group(1)
+def test_unknown_token_cannot_draw_or_reset(client):
+    assert client.post("/manage/nope/draw").status_code == 404
+    assert client.post("/manage/nope/reset").status_code == 404
 
 
 def test_couples_never_draw_each_other(client, db_path):
-    admin_login(client)
-    event_id = create_event(client)
-    add_names(client, event_id, NAMES)
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, NAMES)
     tokens = {n: claim(client, db_path, event_id, n) for n in NAMES}
     ann, ben, cy, dee = (person_id(db_path, event_id, n) for n in NAMES)
-    assert add_couple(client, event_id, ann, ben).status_code == 303
-    assert add_couple(client, event_id, cy, dee).status_code == 303
+    assert add_couple(client, creator, ann, ben).status_code == 303
+    assert add_couple(client, creator, cy, dee).status_code == 303
 
-    assert draw(client, event_id).status_code == 303
+    assert draw(client, creator).status_code == 303
 
     receivers = {n: reveal_receiver(client, tokens[n]) for n in NAMES}
     assert receivers["Ann"] != "Ben" and receivers["Ben"] != "Ann"
@@ -357,31 +414,29 @@ def test_couples_never_draw_each_other(client, db_path):
 
 
 def test_couple_validation(client, db_path):
-    admin_login(client)
-    event_id = create_event(client, "Family")
-    other_id = create_event(client, "Work")
-    add_names(client, event_id, NAMES)
-    add_names(client, other_id, ["Zoe"])
+    event_id, creator = create_event(client, db_path, "Family")
+    other_id, other_creator = create_event(client, db_path, "Work")
+    add_names(client, creator, NAMES)
+    add_names(client, other_creator, ["Zoe"])
     ann, ben = person_id(db_path, event_id, "Ann"), person_id(db_path, event_id, "Ben")
     zoe = person_id(db_path, other_id, "Zoe")
 
-    assert add_couple(client, event_id, ann, ann).status_code == 400
-    assert add_couple(client, event_id, ann, zoe).status_code == 400  # other event
-    assert add_couple(client, event_id, ann, ben).status_code == 303
-    resp = add_couple(client, event_id, ben, ann)  # same couple, reversed
+    assert add_couple(client, creator, ann, ann).status_code == 400
+    assert add_couple(client, creator, ann, zoe).status_code == 400  # other event
+    assert add_couple(client, creator, ann, ben).status_code == 303
+    resp = add_couple(client, creator, ben, ann)  # same couple, reversed
     assert resp.status_code == 400
     assert "already set" in resp.text
 
 
 def test_couple_removal(client, db_path):
-    admin_login(client)
-    event_id = create_event(client)
-    add_names(client, event_id, NAMES)
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, NAMES)
     ann, ben = person_id(db_path, event_id, "Ann"), person_id(db_path, event_id, "Ben")
-    add_couple(client, event_id, ann, ben)
+    add_couple(client, creator, ann, ben)
 
     client.post(
-        f"/admin/events/{event_id}/couples/remove",
+        f"/manage/{creator}/couples/remove",
         data={"person_a": ben, "person_b": ann},
     )
 
@@ -389,47 +444,44 @@ def test_couple_removal(client, db_path):
 
 
 def test_couples_cannot_change_after_draw(client, db_path):
-    admin_login(client)
-    event_id, _ = setup_full_event(client, db_path)
-    draw(client, event_id)
+    event_id, creator, _ = setup_full_event(client, db_path)
+    draw(client, creator)
     ann, ben = person_id(db_path, event_id, "Ann"), person_id(db_path, event_id, "Ben")
 
-    resp = add_couple(client, event_id, ann, ben)
+    resp = add_couple(client, creator, ann, ben)
     assert resp.status_code == 400
     assert "already happened" in resp.text
 
 
 def test_impossible_couples_block_the_draw(client, db_path):
-    admin_login(client)
-    event_id = create_event(client)
-    add_names(client, event_id, ["Ann", "Ben", "Cy"])
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, ["Ann", "Ben", "Cy"])
     for name in ["Ann", "Ben", "Cy"]:
         claim(client, db_path, event_id, name)
     add_couple(
         client,
-        event_id,
+        creator,
         person_id(db_path, event_id, "Ann"),
         person_id(db_path, event_id, "Ben"),
     )
 
-    resp = draw(client, event_id)
+    resp = draw(client, creator)
     assert resp.status_code == 400
     assert "fewer than two valid partners" in resp.text
     assert query(db_path, "SELECT drawn FROM event WHERE id = ?", (event_id,))[0]["drawn"] == 0
     assert query(db_path, "SELECT COUNT(*) AS n FROM assignment")[0]["n"] == 0
 
 
-def test_admin_can_unclaim_one_person(client, db_path):
-    admin_login(client)
-    event_id, tokens = setup_full_event(client, db_path)
+def test_creator_can_unclaim_one_person(client, db_path):
+    event_id, creator, tokens = setup_full_event(client, db_path)
     ann = person_id(db_path, event_id, "Ann")
 
-    resp = client.post(f"/admin/events/{event_id}/participants/{ann}/unclaim")
+    resp = client.post(f"/manage/{creator}/participants/{ann}/unclaim")
     assert resp.status_code == 303
 
     assert client.get(f"/r/{tokens['Ann']}").status_code == 404  # old link is dead
-    assert "3 of 4" in client.get(f"/admin/events/{event_id}").text
-    assert "<strong>" not in client.get(f"/r/{tokens['Ben']}").text  # others unaffected, draw not run
+    assert "3 of 4" in client.get(f"/manage/{creator}").text
+    assert "<strong>" not in client.get(f"/r/{tokens['Ben']}").text  # others unaffected
 
     new_token = claim(client, db_path, event_id, "Ann")
     assert new_token != tokens["Ann"]
@@ -437,20 +489,87 @@ def test_admin_can_unclaim_one_person(client, db_path):
 
 
 def test_unclaim_closed_after_draw(client, db_path):
-    admin_login(client)
-    event_id, tokens = setup_full_event(client, db_path)
-    draw(client, event_id)
+    event_id, creator, tokens = setup_full_event(client, db_path)
+    draw(client, creator)
     ann = person_id(db_path, event_id, "Ann")
 
-    resp = client.post(f"/admin/events/{event_id}/participants/{ann}/unclaim")
+    resp = client.post(f"/manage/{creator}/participants/{ann}/unclaim")
     assert resp.status_code == 400
     assert "already happened" in resp.text
     assert "<strong>" in client.get(f"/r/{tokens['Ann']}").text  # Ann's link still works
 
 
 def test_unclaim_unknown_person_is_rejected(client, db_path):
-    admin_login(client)
-    event_id, _ = setup_full_event(client, db_path)
-    resp = client.post(f"/admin/events/{event_id}/participants/999/unclaim")
+    event_id, creator, _ = setup_full_event(client, db_path)
+    resp = client.post(f"/manage/{creator}/participants/999/unclaim")
     assert resp.status_code == 400
     assert "unclaim that person" in resp.text  # apostrophe is HTML-escaped in the page
+
+
+def test_creator_can_delete_event_and_everything_in_it(client, db_path):
+    event_id, creator, tokens = setup_full_event(client, db_path)
+    ann, ben = person_id(db_path, event_id, "Ann"), person_id(db_path, event_id, "Ben")
+    add_couple(client, creator, ann, ben)
+    draw(client, creator)
+
+    resp = client.post(f"/manage/{creator}/delete")
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/"
+
+    assert client.get(f"/manage/{creator}").status_code == 404
+    assert client.get(f"/r/{tokens['Ann']}").status_code == 404
+    for table in ("event", "participant", "exclusion", "assignment"):
+        assert query(db_path, f"SELECT COUNT(*) AS n FROM {table}")[0]["n"] == 0
+
+
+def test_super_can_delete_any_event(client, db_path):
+    event_id, creator, tokens = setup_full_event(client, db_path)
+    super_login(client)
+
+    resp = client.post(f"/super/events/{event_id}/delete")
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/super"
+
+    assert client.get(f"/manage/{creator}").status_code == 404
+    assert client.get(f"/r/{tokens['Ann']}").status_code == 404
+    assert query(db_path, "SELECT COUNT(*) AS n FROM participant")[0]["n"] == 0
+
+
+def test_super_rotate_replaces_creator_link(client, db_path):
+    event_id, old_creator, _ = setup_full_event(client, db_path)
+    super_login(client)
+
+    resp = client.post(f"/super/events/{event_id}/rotate-creator")
+    assert resp.status_code == 200
+    new_creator = MANAGE_RE.search(resp.text).group(1)
+
+    assert new_creator != old_creator
+    assert client.get(f"/manage/{old_creator}").status_code == 404
+    assert client.get(f"/manage/{new_creator}").status_code == 200
+    assert "3 of 4" not in client.get(f"/manage/{new_creator}").text  # claims are kept
+    assert "4 of 4" in client.get(f"/manage/{new_creator}").text
+
+
+def test_rotate_unknown_event_is_404(client):
+    super_login(client)
+    assert client.post("/super/events/999/rotate-creator").status_code == 404
+    assert client.post("/super/events/999/delete").status_code == 404
+
+
+def test_event_creation_is_rate_limited(app, client):
+    app.state.create_limiter = RateLimiter(limit=2, window_seconds=3600)
+    assert client.post("/events", data={"name": "One"}).status_code == 303
+    assert client.post("/events", data={"name": "Two"}).status_code == 303
+
+    resp = client.post("/events", data={"name": "Three"})
+    assert resp.status_code == 429
+    assert "Too many events" in resp.text
+
+
+def test_super_login_is_rate_limited(app, client):
+    app.state.login_limiter = RateLimiter(limit=2, window_seconds=900)
+    assert client.post("/super/login", data={"password": "nope"}).status_code == 401
+    assert client.post("/super/login", data={"password": "nope"}).status_code == 401
+
+    resp = client.post("/super/login", data={"password": ADMIN_PASSWORD})
+    assert resp.status_code == 429  # even the right password waits

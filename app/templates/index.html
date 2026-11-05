@@ -16,5 +16,15 @@
   <button type="submit">Get my link</button>
 </form>
 
-<p class="muted"><a href="/admin/login">Admin</a></p>
+<section>
+  <h2>Start an event</h2>
+  <p class="muted">You'll get a private link to run it. Keep that link safe; it's the only way back in.</p>
+  <form method="post" action="/events">
+    <label>
+      Event name
+      <input name="name" required maxlength="100" autocomplete="off" placeholder="e.g. Office Christmas 2026">
+    </label>
+    <button type="submit">Create event</button>
+  </form>
+</section>
 {% endblock %}

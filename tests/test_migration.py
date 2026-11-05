@@ -84,6 +84,43 @@ def test_legacy_database_migrates_and_keeps_links_working(tmp_path):
         assert re.search(rf"<strong>{receiver}</strong>", resp.text), resp.text
 
 
+def test_multi_event_database_gets_creator_column(tmp_path):
+    path = str(tmp_path / "multi.db")
+    conn = db.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            code TEXT NOT NULL UNIQUE,
+            drawn INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO event (name, code, created_at)
+            VALUES ('Family', 'fam', '2026-01-01T00:00:00+00:00');
+        """
+    )
+    conn.close()
+
+    db.init_db(path)
+    db.init_db(path)  # running twice must not fail on the existing column
+
+    conn = db.connect(path)
+    try:
+        event = conn.execute("SELECT name, creator_token_hash FROM event").fetchone()
+        assert event["name"] == "Family"
+        assert event["creator_token_hash"] is None  # no creator link until one is issued
+    finally:
+        conn.close()
+
+    app = create_app(db_path=path, admin_password="pw", secret_key="k")
+    client = TestClient(app, follow_redirects=False)
+    client.post("/super/login", data={"password": "pw"})
+    html = client.post("/super/events/1/rotate-creator").text
+    token = re.search(r"/manage/([A-Za-z0-9_-]+)", html).group(1)
+    assert client.get(f"/manage/{token}").status_code == 200
+
+
 def test_init_is_idempotent_after_migration(tmp_path):
     path = str(tmp_path / "legacy.db")
     build_legacy_db(path)

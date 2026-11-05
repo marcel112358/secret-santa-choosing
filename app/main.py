@@ -1,5 +1,7 @@
 import hmac
+import logging
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timezone
@@ -15,12 +17,29 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import db
 from app.crypto import lookup_hash, new_token, open_with, public_key_for, seal_for
 from app.draw import DrawError, make_cycle
+from app.limits import RateLimiter
 
 BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=BASE / "templates")
 router = APIRouter()
 MIN_PARTICIPANTS = 3
 MAX_NAME_LENGTH = 100
+EVENTS_PER_HOUR = 10
+LOGIN_ATTEMPTS_PER_15_MIN = 5
+
+
+class RedactTokens(logging.Filter):
+    """Keeps creator and reveal tokens out of the uvicorn access log."""
+
+    PATTERN = re.compile(r"(/(?:manage|r)/)[A-Za-z0-9_-]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self.PATTERN.sub(r"\1[redacted]", arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        return True
 
 
 def now() -> str:
@@ -35,9 +54,17 @@ def get_conn(request: Request):
         conn.close()
 
 
-def require_admin(request: Request):
-    if not request.session.get("admin"):
+def require_super(request: Request):
+    if not request.session.get("super_admin"):
         raise HTTPException(status_code=401)
+
+
+def client_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def manage_redirect(token: str) -> RedirectResponse:
+    return RedirectResponse(f"/manage/{token}", status_code=303)
 
 
 def get_event_by_code(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
@@ -49,6 +76,17 @@ def get_event_by_code(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None
 def get_event_or_404(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row:
     event = conn.execute(
         "SELECT id, name, code, drawn FROM event WHERE id = ?", (event_id,)
+    ).fetchone()
+    if event is None:
+        raise HTTPException(status_code=404)
+    return event
+
+
+def get_event_by_creator_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row:
+    # Only the hash is stored, so the lookup goes through the hash. Unknown tokens get a 404.
+    event = conn.execute(
+        "SELECT id, name, code, drawn FROM event WHERE creator_token_hash = ?",
+        (lookup_hash(token),),
     ).fetchone()
     if event is None:
         raise HTTPException(status_code=404)
@@ -72,29 +110,66 @@ def render_join(
     )
 
 
-def render_admin_home(request: Request, conn, error: str | None = None, status_code: int = 200):
-    events = conn.execute(
-        "SELECT e.id, e.name, e.drawn, COUNT(p.id) AS total, COUNT(p.token_hash) AS claimed "
-        "FROM event e LEFT JOIN participant p ON p.event_id = e.id "
-        "GROUP BY e.id ORDER BY e.id DESC"
+def render_super_login(request: Request, error: str | None = None, status_code: int = 200):
+    return templates.TemplateResponse(
+        request, "super_login.html", {"error": error}, status_code=status_code
+    )
+
+
+def render_super_home(
+    request: Request,
+    conn,
+    new_link: dict | None = None,
+    error: str | None = None,
+    status_code: int = 200,
+):
+    rows = conn.execute(
+        "SELECT id, name, code, drawn, created_at, creator_token_hash IS NOT NULL AS has_creator "
+        "FROM event ORDER BY id DESC"
     ).fetchall()
+    # Super admin sees names and claim status. Never tokens, keys, or assignments.
+    people = conn.execute(
+        "SELECT event_id, name, token_hash IS NOT NULL AS claimed, "
+        "revealed_at IS NOT NULL AS revealed "
+        "FROM participant ORDER BY name COLLATE NOCASE"
+    ).fetchall()
+    people_by_event: dict[int, list] = {}
+    for person in people:
+        people_by_event.setdefault(person["event_id"], []).append(person)
+
+    events = []
+    for row in rows:
+        event_people = people_by_event.get(row["id"], [])
+        events.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "drawn": row["drawn"],
+                "created_at": row["created_at"],
+                "has_creator": row["has_creator"],
+                "join_link": request.url_for("join", code=row["code"]),
+                "people": event_people,
+                "total": len(event_people),
+                "claimed": sum(1 for person in event_people if person["claimed"]),
+            }
+        )
     return templates.TemplateResponse(
         request,
-        "admin.html",
-        {"error": error, "events": events},
+        "super_home.html",
+        {"error": error, "events": events, "new_link": new_link},
         status_code=status_code,
     )
 
 
-def render_admin_event(
-    request: Request, conn, event_id: int, error: str | None = None, status_code: int = 200
+def render_manage(
+    request: Request, conn, token: str, error: str | None = None, status_code: int = 200
 ):
-    event = get_event_or_404(conn, event_id)
+    event = get_event_by_creator_token(conn, token)
     # Only status columns are selected: no tokens, keys, or assignments.
     people = conn.execute(
         "SELECT id, name, token_hash IS NOT NULL AS claimed, revealed_at IS NOT NULL AS revealed "
         "FROM participant WHERE event_id = ? ORDER BY name COLLATE NOCASE",
-        (event_id,),
+        (event["id"],),
     ).fetchall()
     couples = conn.execute(
         "SELECT a.id AS a_id, a.name AS a_name, b.id AS b_id, b.name AS b_name "
@@ -102,16 +177,17 @@ def render_admin_event(
         "JOIN participant a ON a.id = x.person_a "
         "JOIN participant b ON b.id = x.person_b "
         "WHERE x.event_id = ? ORDER BY a.name COLLATE NOCASE",
-        (event_id,),
+        (event["id"],),
     ).fetchall()
     total = len(people)
     claimed = sum(1 for person in people if person["claimed"])
     can_draw = not event["drawn"] and total >= MIN_PARTICIPANTS and claimed == total
     return templates.TemplateResponse(
         request,
-        "admin_event.html",
+        "manage.html",
         {
             "error": error,
+            "token": token,
             "event": event,
             "join_link": request.url_for("join", code=event["code"]),
             "people": people,
@@ -128,6 +204,30 @@ def render_admin_event(
 @router.get("/")
 def index(request: Request):
     return render_index(request)
+
+
+@router.post("/events")
+def create_event(
+    request: Request,
+    name: str = Form(...),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    limiter = request.app.state.create_limiter
+    key = client_key(request)
+    if limiter.is_limited(key):
+        return render_index(request, "Too many events from here. Try again later.", 429)
+
+    name = name.strip()
+    if not name or len(name) > MAX_NAME_LENGTH:
+        return render_index(request, f"Event name must be 1–{MAX_NAME_LENGTH} characters.", 400)
+
+    token = new_token()
+    conn.execute(
+        "INSERT INTO event (name, code, creator_token_hash, created_at) VALUES (?, ?, ?, ?)",
+        (name, db.new_event_code(), lookup_hash(token), now()),
+    )
+    limiter.hit(key)
+    return manage_redirect(token)
 
 
 @router.get("/join/{code}", name="join")
@@ -218,110 +318,58 @@ def reveal(token: str, request: Request, conn: sqlite3.Connection = Depends(get_
     return templates.TemplateResponse(request, "reveal.html", context)
 
 
-@router.get("/admin/login")
-def login_form(request: Request):
-    return templates.TemplateResponse(request, "admin_login.html", {"error": None})
+# Creator pages. The token in the path is the only credential, and it is scoped to one event.
 
 
-@router.post("/admin/login")
-def login(request: Request, password: str = Form(...)):
-    expected = request.app.state.admin_password.encode()
-    if not hmac.compare_digest(password.encode(), expected):
-        return templates.TemplateResponse(
-            request,
-            "admin_login.html",
-            {"error": "Wrong password."},
-            status_code=401,
-        )
-    request.session["admin"] = True
-    return RedirectResponse("/admin", status_code=303)
+@router.get("/manage/{token}", name="manage")
+def manage(token: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    return render_manage(request, conn, token)
 
 
-@router.post("/admin/logout")
-def logout(request: Request):
-    request.session.clear()
-    return RedirectResponse("/", status_code=303)
-
-
-@router.get("/admin", dependencies=[Depends(require_admin)])
-def admin_home(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
-    return render_admin_home(request, conn)
-
-
-@router.post("/admin/events", dependencies=[Depends(require_admin)])
-def create_event(
-    request: Request,
-    name: str = Form(...),
-    conn: sqlite3.Connection = Depends(get_conn),
-):
-    name = name.strip()
-    if not name or len(name) > MAX_NAME_LENGTH:
-        return render_admin_home(
-            request, conn, f"Event name must be 1–{MAX_NAME_LENGTH} characters.", 400
-        )
-    cur = conn.execute(
-        "INSERT INTO event (name, code, created_at) VALUES (?, ?, ?)",
-        (name, db.new_event_code(), now()),
-    )
-    return RedirectResponse(f"/admin/events/{cur.lastrowid}", status_code=303)
-
-
-@router.get("/admin/events/{event_id}", dependencies=[Depends(require_admin)])
-def admin_event(
-    event_id: int, request: Request, conn: sqlite3.Connection = Depends(get_conn)
-):
-    return render_admin_event(request, conn, event_id)
-
-
-@router.post("/admin/events/{event_id}/participants", dependencies=[Depends(require_admin)])
+@router.post("/manage/{token}/participants")
 def add_participant(
-    event_id: int,
+    token: str,
     request: Request,
     name: str = Form(...),
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    event = get_event_or_404(conn, event_id)
+    event = get_event_by_creator_token(conn, token)
     name = name.strip()
     if event["drawn"]:
-        return render_admin_event(request, conn, event_id, "The draw has already happened.", 400)
+        return render_manage(request, conn, token, "The draw has already happened.", 400)
     if not name or len(name) > MAX_NAME_LENGTH:
-        return render_admin_event(
-            request, conn, event_id, f"Name must be 1–{MAX_NAME_LENGTH} characters.", 400
+        return render_manage(
+            request, conn, token, f"Name must be 1–{MAX_NAME_LENGTH} characters.", 400
         )
     try:
         conn.execute(
-            "INSERT INTO participant (event_id, name) VALUES (?, ?)", (event_id, name)
+            "INSERT INTO participant (event_id, name) VALUES (?, ?)", (event["id"], name)
         )
     except sqlite3.IntegrityError:
-        return render_admin_event(
-            request, conn, event_id, f"{name} is already on this list.", 400
-        )
-    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
+        return render_manage(request, conn, token, f"{name} is already on this list.", 400)
+    return manage_redirect(token)
 
 
-@router.post(
-    "/admin/events/{event_id}/participants/{person_id}/unclaim",
-    dependencies=[Depends(require_admin)],
-)
+@router.post("/manage/{token}/participants/{person_id}/unclaim")
 def unclaim_participant(
-    event_id: int,
+    token: str,
     person_id: int,
     request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
     # Their old link stops working. They can claim their name again for a new one.
-    event = get_event_or_404(conn, event_id)
+    event = get_event_by_creator_token(conn, token)
     if event["drawn"]:
-        return render_admin_event(request, conn, event_id, "The draw has already happened.", 400)
+        return render_manage(request, conn, token, "The draw has already happened.", 400)
     cur = conn.execute(
         "UPDATE participant SET token_hash = NULL, public_key = NULL, claimed_at = NULL "
         "WHERE id = ? AND event_id = ? "
         "AND (SELECT drawn FROM event WHERE id = ?) = 0",
-        (person_id, event_id, event_id),
+        (person_id, event["id"], event["id"]),
     )
     if cur.rowcount == 0:
-        return render_admin_event(request, conn, event_id, "Couldn't unclaim that person.", 400)
-    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
+        return render_manage(request, conn, token, "Couldn't unclaim that person.", 400)
+    return manage_redirect(token)
 
 
 def _draw(conn: sqlite3.Connection, event_id: int) -> str | None:
@@ -362,88 +410,153 @@ def _members(conn: sqlite3.Connection, event_id: int) -> set[int]:
     return {row["id"] for row in rows}
 
 
-@router.post("/admin/events/{event_id}/couples", dependencies=[Depends(require_admin)])
+@router.post("/manage/{token}/couples")
 def add_couple(
-    event_id: int,
+    token: str,
     request: Request,
     person_a: int = Form(...),
     person_b: int = Form(...),
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    event = get_event_or_404(conn, event_id)
+    event = get_event_by_creator_token(conn, token)
     if event["drawn"]:
-        return render_admin_event(request, conn, event_id, "The draw has already happened.", 400)
+        return render_manage(request, conn, token, "The draw has already happened.", 400)
     if person_a == person_b:
-        return render_admin_event(request, conn, event_id, "Pick two different people.", 400)
-    if not {person_a, person_b} <= _members(conn, event_id):
-        return render_admin_event(request, conn, event_id, "Unknown participant.", 400)
+        return render_manage(request, conn, token, "Pick two different people.", 400)
+    if not {person_a, person_b} <= _members(conn, event["id"]):
+        return render_manage(request, conn, token, "Unknown participant.", 400)
     low, high = sorted((person_a, person_b))
     try:
         conn.execute(
             "INSERT INTO exclusion (event_id, person_a, person_b) VALUES (?, ?, ?)",
-            (event_id, low, high),
+            (event["id"], low, high),
         )
     except sqlite3.IntegrityError:
-        return render_admin_event(request, conn, event_id, "That couple is already set.", 400)
-    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
+        return render_manage(request, conn, token, "That couple is already set.", 400)
+    return manage_redirect(token)
 
 
-@router.post("/admin/events/{event_id}/couples/remove", dependencies=[Depends(require_admin)])
+@router.post("/manage/{token}/couples/remove")
 def remove_couple(
-    event_id: int,
+    token: str,
     request: Request,
     person_a: int = Form(...),
     person_b: int = Form(...),
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    event = get_event_or_404(conn, event_id)
+    event = get_event_by_creator_token(conn, token)
     if event["drawn"]:
-        return render_admin_event(request, conn, event_id, "The draw has already happened.", 400)
+        return render_manage(request, conn, token, "The draw has already happened.", 400)
     low, high = sorted((person_a, person_b))
     conn.execute(
         "DELETE FROM exclusion WHERE event_id = ? AND person_a = ? AND person_b = ?",
-        (event_id, low, high),
+        (event["id"], low, high),
     )
-    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
+    return manage_redirect(token)
 
 
-@router.post("/admin/events/{event_id}/draw", dependencies=[Depends(require_admin)])
-def run_draw(event_id: int, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+@router.post("/manage/{token}/draw")
+def run_draw(token: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    event = get_event_by_creator_token(conn, token)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        error = _draw(conn, event_id)
+        error = _draw(conn, event["id"])
         conn.execute("ROLLBACK" if error else "COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
     if error:
-        return render_admin_event(request, conn, event_id, error, 400)
-    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
+        return render_manage(request, conn, token, error, 400)
+    return manage_redirect(token)
 
 
-@router.post("/admin/events/{event_id}/reset", dependencies=[Depends(require_admin)])
-def reset(event_id: int, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+@router.post("/manage/{token}/reset")
+def reset(token: str, conn: sqlite3.Connection = Depends(get_conn)):
     # Clears claims as well as the draw: a lost link can't be recovered any other way
     # without the admin ever holding a token. Everyone claims again afterwards.
-    get_event_or_404(conn, event_id)
+    event = get_event_by_creator_token(conn, token)
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
             "DELETE FROM assignment WHERE giver_id IN "
             "(SELECT id FROM participant WHERE event_id = ?)",
-            (event_id,),
+            (event["id"],),
         )
         conn.execute(
             "UPDATE participant SET token_hash = NULL, public_key = NULL, "
             "claimed_at = NULL, revealed_at = NULL WHERE event_id = ?",
-            (event_id,),
+            (event["id"],),
         )
-        conn.execute("UPDATE event SET drawn = 0 WHERE id = ?", (event_id,))
+        conn.execute("UPDATE event SET drawn = 0 WHERE id = ?", (event["id"],))
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    return RedirectResponse(f"/admin/events/{event_id}", status_code=303)
+    return manage_redirect(token)
+
+
+@router.post("/manage/{token}/delete")
+def delete_own_event(token: str, conn: sqlite3.Connection = Depends(get_conn)):
+    # Participants, couples, and assignments go with it through ON DELETE CASCADE.
+    event = get_event_by_creator_token(conn, token)
+    conn.execute("DELETE FROM event WHERE id = ?", (event["id"],))
+    return RedirectResponse("/", status_code=303)
+
+
+# Super admin. Separate session flag, so a creator link never grants access here.
+
+
+@router.get("/super/login")
+def super_login_form(request: Request):
+    return render_super_login(request)
+
+
+@router.post("/super/login")
+def super_login(request: Request, password: str = Form(...)):
+    limiter = request.app.state.login_limiter
+    key = client_key(request)
+    if limiter.is_limited(key):
+        return render_super_login(request, "Too many attempts. Try again in a few minutes.", 429)
+    expected = request.app.state.admin_password.encode()
+    if not hmac.compare_digest(password.encode(), expected):
+        limiter.hit(key)
+        return render_super_login(request, "Wrong password.", 401)
+    request.session["super_admin"] = True
+    return RedirectResponse("/super", status_code=303)
+
+
+@router.post("/super/logout")
+def super_logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/", status_code=303)
+
+
+@router.get("/super", dependencies=[Depends(require_super)])
+def super_home(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    return render_super_home(request, conn)
+
+
+@router.post("/super/events/{event_id}/delete", dependencies=[Depends(require_super)])
+def super_delete_event(event_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    get_event_or_404(conn, event_id)
+    conn.execute("DELETE FROM event WHERE id = ?", (event_id,))
+    return RedirectResponse("/super", status_code=303)
+
+
+@router.post("/super/events/{event_id}/rotate-creator", dependencies=[Depends(require_super)])
+def super_rotate_creator(
+    event_id: int, request: Request, conn: sqlite3.Connection = Depends(get_conn)
+):
+    # Replaces any existing creator link, so an old one stops working. Also issues the
+    # first link for events created before creator links existed.
+    event = get_event_or_404(conn, event_id)
+    token = new_token()
+    conn.execute(
+        "UPDATE event SET creator_token_hash = ? WHERE id = ?", (lookup_hash(token), event_id)
+    )
+    new_link = {"event": event["name"], "url": str(request.url_for("manage", token=token))}
+    # Shown once, in this response only. It is never stored in plain text.
+    return render_super_home(request, conn, new_link=new_link)
 
 
 def create_app(
@@ -459,16 +572,31 @@ def create_app(
 
     db.init_db(db_path)
 
+    access_log = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, RedactTokens) for f in access_log.filters):
+        access_log.addFilter(RedactTokens())
+
     app = FastAPI(title="Secret Santa")
     app.state.db_path = db_path
     app.state.admin_password = admin_password
+    app.state.create_limiter = RateLimiter(limit=EVENTS_PER_HOUR, window_seconds=3600)
+    app.state.login_limiter = RateLimiter(limit=LOGIN_ATTEMPTS_PER_15_MIN, window_seconds=900)
     app.add_middleware(SessionMiddleware, secret_key=secret_key)
     app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
+
+    @app.middleware("http")
+    async def private_pages(request: Request, call_next):
+        response = await call_next(request)
+        # These URLs carry a secret. Keep them out of Referer headers and caches.
+        if request.url.path.startswith(("/manage/", "/r/")):
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.exception_handler(HTTPException)
     async def handle_http_error(request: Request, exc: HTTPException):
         if exc.status_code == 401:
-            return RedirectResponse("/admin/login", status_code=303)
+            return RedirectResponse("/super/login", status_code=303)
         return await http_exception_handler(request, exc)
 
     app.include_router(router)

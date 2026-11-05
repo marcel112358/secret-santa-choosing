@@ -58,6 +58,7 @@ button.danger { background: #555; }
 .copy { font-family: ui-monospace, monospace; font-size: 0.85rem; background: #faf7f2; }
 
 .inline { display: inline; }
+.actions { display: flex; gap: 1rem; }
 .inline-form { display: flex; gap: 0.5rem; }
 .inline-form input,
 .inline-form select { margin-top: 0; }
