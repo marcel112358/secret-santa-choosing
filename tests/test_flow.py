@@ -573,3 +573,224 @@ def test_super_login_is_rate_limited(app, client):
 
     resp = client.post("/super/login", data={"password": ADMIN_PASSWORD})
     assert resp.status_code == 429  # even the right password waits
+
+
+def set_signup(client, token, mode):
+    return client.post(f"/manage/{token}/signup-mode", data={"mode": mode})
+
+
+def test_events_default_to_closed_signup(client, db_path):
+    event_id, _ = create_event(client, db_path)
+    assert query(db_path, "SELECT signup_mode FROM event WHERE id = ?", (event_id,))[0][
+        "signup_mode"
+    ] == "closed"
+
+
+def test_closed_signup_rejects_names_not_on_list(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, NAMES)
+    resp = client.post("/claim", data={"code": event_code(db_path, event_id), "name": "Zed"})
+    assert resp.status_code == 400
+    assert "on the list" in resp.text
+
+
+def test_open_signup_lets_anyone_join_by_name(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    assert set_signup(client, creator, "open").status_code == 303
+
+    resp = client.post("/claim", data={"code": event_code(db_path, event_id), "name": "Ann"})
+    assert resp.status_code == 200
+    link = LINK_RE.search(resp.text).group(1)
+
+    assert client.get(f"/r/{link}").status_code == 200
+    assert "1 of 1" in client.get(f"/manage/{creator}").text
+    assert person_id(db_path, event_id, "Ann")  # the creator never added Ann
+
+
+def test_open_signup_claims_a_name_the_creator_added(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, ["Ann", "Ben"])
+    set_signup(client, creator, "open")
+
+    link = claim(client, db_path, event_id, "Ann")  # goes through /claim in open mode
+    assert link
+    assert len(query(db_path, "SELECT id FROM participant WHERE name = 'Ann'")) == 1
+
+
+def test_open_signup_rejects_a_taken_name(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    set_signup(client, creator, "open")
+    claim(client, db_path, event_id, "Ann")
+
+    resp = client.post("/claim", data={"code": event_code(db_path, event_id), "name": "ann"})
+    assert resp.status_code == 400
+    assert "already taken" in resp.text
+    assert len(query(db_path, "SELECT id FROM participant")) == 1
+
+
+def test_open_signup_rejects_blank_and_long_names(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    set_signup(client, creator, "open")
+    code = event_code(db_path, event_id)
+
+    assert client.post("/claim", data={"code": code, "name": "   "}).status_code == 400
+    resp = client.post("/claim", data={"code": code, "name": "x" * 101})
+    assert resp.status_code == 400
+    assert "1–100 characters" in resp.text
+    assert query(db_path, "SELECT COUNT(*) AS n FROM participant")[0]["n"] == 0
+
+
+def test_open_signup_stops_after_draw(client, db_path):
+    event_id, creator, _ = setup_full_event(client, db_path)
+    set_signup(client, creator, "open")
+    draw(client, creator)
+
+    resp = client.post("/claim", data={"code": event_code(db_path, event_id), "name": "Zoe"})
+    assert resp.status_code == 400
+    assert "already happened" in resp.text
+    assert query(db_path, "SELECT COUNT(*) AS n FROM participant")[0]["n"] == 4
+
+
+def test_closing_signup_stops_new_names(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    set_signup(client, creator, "open")
+    claim(client, db_path, event_id, "Ann")
+    assert set_signup(client, creator, "closed").status_code == 303
+
+    resp = client.post("/claim", data={"code": event_code(db_path, event_id), "name": "Ben"})
+    assert resp.status_code == 400
+    assert "on the list" in resp.text
+    assert "1 of 1" in client.get(f"/manage/{creator}").text  # Ann keeps her link
+
+
+def test_signup_mode_cannot_change_after_draw(client, db_path):
+    event_id, creator, _ = setup_full_event(client, db_path)
+    draw(client, creator)
+
+    resp = set_signup(client, creator, "open")
+    assert resp.status_code == 400
+    assert "already happened" in resp.text
+    assert query(db_path, "SELECT signup_mode FROM event WHERE id = ?", (event_id,))[0][
+        "signup_mode"
+    ] == "closed"
+
+
+def test_signup_mode_rejects_unknown_values(client, db_path):
+    _, creator = create_event(client, db_path)
+    resp = set_signup(client, creator, "maybe")
+    assert resp.status_code == 400
+    assert "open or closed" in resp.text
+
+
+def test_signup_mode_needs_the_right_creator_token(client, db_path):
+    _, creator = create_event(client, db_path)
+    assert set_signup(client, "not-a-real-token", "open").status_code == 404
+
+
+def test_join_page_text_follows_mode(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    code = event_code(db_path, event_id)
+    assert "Pick your name from the list" in client.get(f"/join/{code}").text
+
+    set_signup(client, creator, "open")
+    html = client.get(f"/join/{code}").text
+    assert "Type your name to join" in html
+    assert 'name="name"' in html
+
+
+def test_super_shows_signup_mode(client, db_path):
+    _, creator = create_event(client, db_path, "Family")
+    set_signup(client, creator, "open")
+    super_login(client)
+    assert "sign-up open" in client.get("/super").text
+
+
+def remove_person(client, token, person):
+    return client.post(f"/manage/{token}/participants/{person}/remove")
+
+
+def test_creator_can_remove_an_unclaimed_person(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, NAMES)
+    dee = person_id(db_path, event_id, "Dee")
+
+    resp = remove_person(client, creator, dee)
+    assert resp.status_code == 303
+    assert "Dee" not in client.get(f"/manage/{creator}").text
+    assert "0 of 3" in client.get(f"/manage/{creator}").text
+
+
+def test_removing_a_claimed_person_kills_their_link(client, db_path):
+    event_id, creator, tokens = setup_full_event(client, db_path)
+    ann = person_id(db_path, event_id, "Ann")
+
+    assert remove_person(client, creator, ann).status_code == 303
+    assert client.get(f"/r/{tokens['Ann']}").status_code == 404
+    assert "3 of 3" in client.get(f"/manage/{creator}").text
+
+
+def test_removing_a_person_also_removes_their_couples(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, NAMES)
+    ann, ben, cy, dee = (person_id(db_path, event_id, n) for n in NAMES)
+    add_couple(client, creator, ann, ben)
+    add_couple(client, creator, cy, dee)
+
+    remove_person(client, creator, ben)
+
+    assert query(db_path, "SELECT COUNT(*) AS n FROM exclusion")[0]["n"] == 1
+    assert "Ann &amp; Ben" not in client.get(f"/manage/{creator}").text
+
+
+def test_removed_name_can_be_added_again(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, ["Ann", "Ben"])
+    remove_person(client, creator, person_id(db_path, event_id, "Ann"))
+
+    add_names(client, creator, ["Ann"])
+    assert len(query(db_path, "SELECT id FROM participant WHERE name = 'Ann'")) == 1
+
+
+def test_remove_is_blocked_after_draw(client, db_path):
+    event_id, creator, tokens = setup_full_event(client, db_path)
+    draw(client, creator)
+    ann = person_id(db_path, event_id, "Ann")
+
+    resp = remove_person(client, creator, ann)
+    assert resp.status_code == 400
+    assert "already happened" in resp.text
+    assert "<strong>" in client.get(f"/r/{tokens['Ann']}").text
+
+
+def test_creator_cannot_remove_someone_from_another_event(client, db_path):
+    first, first_creator = create_event(client, db_path, "Family")
+    second, second_creator = create_event(client, db_path, "Work")
+    add_names(client, first_creator, NAMES)
+    add_names(client, second_creator, ["Zoe"])
+    zoe = person_id(db_path, second, "Zoe")
+
+    resp = remove_person(client, first_creator, zoe)
+    assert resp.status_code == 400
+    assert "remove that person" in resp.text
+    assert len(query(db_path, "SELECT id FROM participant WHERE name = 'Zoe'")) == 1
+
+
+def test_remove_unknown_person_is_rejected(client, db_path):
+    _, creator = create_event(client, db_path)
+    resp = remove_person(client, creator, 999)
+    assert resp.status_code == 400
+    assert "remove that person" in resp.text
+
+
+def test_creator_page_has_remove_button_only_before_draw(client, db_path):
+    event_id, creator = create_event(client, db_path)
+    add_names(client, creator, ["Ann"])
+    ann = person_id(db_path, event_id, "Ann")
+    assert f"/manage/{creator}/participants/{ann}/remove" in client.get(f"/manage/{creator}").text
+
+    claim(client, db_path, event_id, "Ann")
+    add_names(client, creator, ["Ben", "Cy"])
+    for name in ["Ben", "Cy"]:
+        claim(client, db_path, event_id, name)
+    draw(client, creator)
+    assert "/remove" not in client.get(f"/manage/{creator}").text

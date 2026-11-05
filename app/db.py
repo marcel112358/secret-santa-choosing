@@ -10,7 +10,8 @@ SCHEMA = [
         code TEXT NOT NULL UNIQUE,
         drawn INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
-        creator_token_hash TEXT
+        creator_token_hash TEXT,
+        signup_mode TEXT NOT NULL DEFAULT 'closed' CHECK (signup_mode IN ('closed', 'open'))
     )
     """,
     """
@@ -69,6 +70,12 @@ def init_db(path: str) -> None:
             conn.execute(statement)
         # Multi-event databases created before creator links lack this column.
         _ensure_column(conn, "event", "creator_token_hash", "TEXT")
+        _ensure_column(
+            conn,
+            "event",
+            "signup_mode",
+            "TEXT NOT NULL DEFAULT 'closed' CHECK (signup_mode IN ('closed', 'open'))",
+        )
         for statement in INDEXES:
             conn.execute(statement)
     finally:

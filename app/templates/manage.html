@@ -21,6 +21,21 @@
 </section>
 
 <section>
+  <h2>Sign-up</h2>
+  {% if signup_mode == "open" %}
+  <p class="muted">Open: anyone with the invite link can type their name and join. You can still add names yourself.</p>
+  {% else %}
+  <p class="muted">Closed: you add the names, and each person claims their own name from the invite link.</p>
+  {% endif %}
+  {% if not event.drawn %}
+  <form method="post" action="/manage/{{ token }}/signup-mode" class="inline-form">
+    <input type="hidden" name="mode" value="{{ 'closed' if signup_mode == 'open' else 'open' }}">
+    <button type="submit">{{ "Close sign-up" if signup_mode == "open" else "Open sign-up" }}</button>
+  </form>
+  {% endif %}
+</section>
+
+<section>
   <h2>Participants</h2>
   <table>
     <tr><th>Name</th><th>Link claimed</th><th>Match opened</th><th></th></tr>
@@ -30,9 +45,14 @@
       <td>{{ "yes" if p.claimed else "no" }}</td>
       <td>{{ "yes" if p.revealed else "no" }}</td>
       <td>
-        {% if p.claimed and not event.drawn %}
+        {% if not event.drawn %}
+        {% if p.claimed %}
         <form method="post" action="/manage/{{ token }}/participants/{{ p.id }}/unclaim" class="inline" onsubmit="return confirm('Unclaim this person? Their current link will stop working.');">
           <button type="submit" class="link">Unclaim</button>
+        </form>
+        {% endif %}
+        <form method="post" action="/manage/{{ token }}/participants/{{ p.id }}/remove" class="inline" onsubmit="return confirm('Remove this person from the event? Their couples go too, and any link they have stops working.');">
+          <button type="submit" class="link">Remove</button>
         </form>
         {% endif %}
       </td>

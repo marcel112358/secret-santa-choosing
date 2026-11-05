@@ -23,6 +23,7 @@
   <p class="muted">
     Created {{ e.created_at[:10] }} ·
     {{ "drawn" if e.drawn else "open" }} ·
+    sign-up {{ "open" if e.signup_mode == "open" else "closed" }} ·
     {{ e.claimed }} / {{ e.total }} claimed ·
     creator link: {{ "yes" if e.has_creator else "none" }}
   </p>

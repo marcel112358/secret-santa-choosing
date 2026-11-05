@@ -107,9 +107,12 @@ def test_multi_event_database_gets_creator_column(tmp_path):
 
     conn = db.connect(path)
     try:
-        event = conn.execute("SELECT name, creator_token_hash FROM event").fetchone()
+        event = conn.execute(
+            "SELECT name, creator_token_hash, signup_mode FROM event"
+        ).fetchone()
         assert event["name"] == "Family"
         assert event["creator_token_hash"] is None  # no creator link until one is issued
+        assert event["signup_mode"] == "closed"  # existing events keep today's behaviour
     finally:
         conn.close()
 

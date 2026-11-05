@@ -6,7 +6,11 @@
 {% if event.drawn %}
   <p>The draw has already happened, so new people can't join this event.</p>
 {% else %}
+  {% if event.signup_mode == "open" %}
+  <p>Type your name to join and get your private link.</p>
+  {% else %}
   <p>Pick your name from the list to get your private link.</p>
+  {% endif %}
 
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 

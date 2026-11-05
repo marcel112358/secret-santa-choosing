@@ -26,6 +26,7 @@ MIN_PARTICIPANTS = 3
 MAX_NAME_LENGTH = 100
 EVENTS_PER_HOUR = 10
 LOGIN_ATTEMPTS_PER_15_MIN = 5
+SIGNUP_MODES = ("closed", "open")
 
 
 class RedactTokens(logging.Filter):
@@ -69,13 +70,13 @@ def manage_redirect(token: str) -> RedirectResponse:
 
 def get_event_by_code(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT id, name, code, drawn FROM event WHERE code = ?", (code,)
+        "SELECT id, name, code, drawn, signup_mode FROM event WHERE code = ?", (code,)
     ).fetchone()
 
 
 def get_event_or_404(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row:
     event = conn.execute(
-        "SELECT id, name, code, drawn FROM event WHERE id = ?", (event_id,)
+        "SELECT id, name, code, drawn, signup_mode FROM event WHERE id = ?", (event_id,)
     ).fetchone()
     if event is None:
         raise HTTPException(status_code=404)
@@ -85,7 +86,7 @@ def get_event_or_404(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row:
 def get_event_by_creator_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row:
     # Only the hash is stored, so the lookup goes through the hash. Unknown tokens get a 404.
     event = conn.execute(
-        "SELECT id, name, code, drawn FROM event WHERE creator_token_hash = ?",
+        "SELECT id, name, code, drawn, signup_mode FROM event WHERE creator_token_hash = ?",
         (lookup_hash(token),),
     ).fetchone()
     if event is None:
@@ -124,7 +125,8 @@ def render_super_home(
     status_code: int = 200,
 ):
     rows = conn.execute(
-        "SELECT id, name, code, drawn, created_at, creator_token_hash IS NOT NULL AS has_creator "
+        "SELECT id, name, code, drawn, signup_mode, created_at, "
+        "creator_token_hash IS NOT NULL AS has_creator "
         "FROM event ORDER BY id DESC"
     ).fetchall()
     # Super admin sees names and claim status. Never tokens, keys, or assignments.
@@ -145,6 +147,7 @@ def render_super_home(
                 "id": row["id"],
                 "name": row["name"],
                 "drawn": row["drawn"],
+                "signup_mode": row["signup_mode"],
                 "created_at": row["created_at"],
                 "has_creator": row["has_creator"],
                 "join_link": request.url_for("join", code=row["code"]),
@@ -189,6 +192,7 @@ def render_manage(
             "error": error,
             "token": token,
             "event": event,
+            "signup_mode": event["signup_mode"],
             "join_link": request.url_for("join", code=event["code"]),
             "people": people,
             "couples": couples,
@@ -238,6 +242,68 @@ def join(code: str, request: Request, conn: sqlite3.Connection = Depends(get_con
     return render_join(request, event)
 
 
+def render_claimed(request: Request, event: sqlite3.Row, name: str, token: str):
+    return templates.TemplateResponse(
+        request,
+        "claimed.html",
+        {
+            "link": request.url_for("reveal", token=token),
+            "name": name,
+            "event_name": event["name"],
+        },
+    )
+
+
+def _add_or_claim(conn: sqlite3.Connection, event_id: int, name: str, token: str) -> str | None:
+    """Run inside an open transaction. Adds a new name, or claims one the creator already
+    added. Returns an error message or None."""
+    event = conn.execute(
+        "SELECT drawn, signup_mode FROM event WHERE id = ?", (event_id,)
+    ).fetchone()
+    if event["drawn"] or event["signup_mode"] != "open":
+        return "Sign-up is closed."
+    person = conn.execute(
+        "SELECT id, token_hash FROM participant WHERE event_id = ? AND name = ?",
+        (event_id, name),
+    ).fetchone()
+    if person is not None and person["token_hash"] is not None:
+        return "That name is already taken. Use your personal link."
+    values = (lookup_hash(token), public_key_for(token), now())
+    if person is None:
+        conn.execute(
+            "INSERT INTO participant (event_id, name, token_hash, public_key, claimed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event_id, name, *values),
+        )
+    else:
+        conn.execute(
+            "UPDATE participant SET token_hash = ?, public_key = ?, claimed_at = ? WHERE id = ?",
+            (*values, person["id"]),
+        )
+    return None
+
+
+def sign_up(request: Request, conn: sqlite3.Connection, event: sqlite3.Row, name: str):
+    def fail(message: str):
+        return render_join(request, event, message, 400)
+
+    if not name or len(name) > MAX_NAME_LENGTH:
+        return fail(f"Name must be 1–{MAX_NAME_LENGTH} characters.")
+
+    token = new_token()
+    # BEGIN IMMEDIATE serializes this with the draw, so nobody signs up after it.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        error = _add_or_claim(conn, event["id"], name, token)
+        conn.execute("ROLLBACK" if error else "COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    if error:
+        return fail(error)
+    return render_claimed(request, event, name, token)
+
+
 @router.post("/claim")
 def claim(
     request: Request,
@@ -255,6 +321,8 @@ def claim(
     name = name.strip()
     if event["drawn"]:
         return fail("The draw has already happened.")
+    if event["signup_mode"] == "open":
+        return sign_up(request, conn, event, name)
     person = conn.execute(
         "SELECT id, token_hash FROM participant WHERE event_id = ? AND name = ?",
         (event["id"], name),
@@ -275,15 +343,7 @@ def claim(
     if cur.rowcount == 0:
         return fail("Claiming is closed for this name.")
 
-    return templates.TemplateResponse(
-        request,
-        "claimed.html",
-        {
-            "link": request.url_for("reveal", token=token),
-            "name": name,
-            "event_name": event["name"],
-        },
-    )
+    return render_claimed(request, event, name, token)
 
 
 @router.get("/r/{token}", name="reveal")
@@ -369,6 +429,46 @@ def unclaim_participant(
     )
     if cur.rowcount == 0:
         return render_manage(request, conn, token, "Couldn't unclaim that person.", 400)
+    return manage_redirect(token)
+
+
+@router.post("/manage/{token}/participants/{person_id}/remove")
+def remove_participant(
+    token: str,
+    person_id: int,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    # Deletes the person outright. Their couples go with them through ON DELETE CASCADE.
+    event = get_event_by_creator_token(conn, token)
+    if event["drawn"]:
+        return render_manage(request, conn, token, "The draw has already happened.", 400)
+    cur = conn.execute(
+        "DELETE FROM participant WHERE id = ? AND event_id = ? "
+        "AND (SELECT drawn FROM event WHERE id = ?) = 0",
+        (person_id, event["id"], event["id"]),
+    )
+    if cur.rowcount == 0:
+        return render_manage(request, conn, token, "Couldn't remove that person.", 400)
+    return manage_redirect(token)
+
+
+@router.post("/manage/{token}/signup-mode")
+def set_signup_mode(
+    token: str,
+    request: Request,
+    mode: str = Form(...),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    event = get_event_by_creator_token(conn, token)
+    if mode not in SIGNUP_MODES:
+        return render_manage(request, conn, token, "Pick open or closed sign-up.", 400)
+    # Guarded like the other draw-sensitive writes, so a draw can't race this change.
+    cur = conn.execute(
+        "UPDATE event SET signup_mode = ? WHERE id = ? AND drawn = 0", (mode, event["id"])
+    )
+    if cur.rowcount == 0:
+        return render_manage(request, conn, token, "The draw has already happened.", 400)
     return manage_redirect(token)
 
 
