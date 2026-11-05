@@ -1,33 +1,60 @@
 {% extends "base.html" %}
+{% block title %}Super admin · Secret Santa{% endblock %}
 {% block content %}
 <p class="muted">
-  <a href="/">Participant page</a> ·
-  <form method="post" action="/admin/logout" class="inline"><button class="link">Log out</button></form>
+  <a href="/">Home</a> ·
+  <form method="post" action="/super/logout" class="inline"><button class="link">Log out</button></form>
 </p>
+
+<h2>All events</h2>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
+{% if new_link %}
 <section>
-  <h2>Events</h2>
+  <p class="warning"><strong>New creator link for {{ new_link.event }}.</strong> It is shown only once. Any older creator link for this event no longer works.</p>
+  <input class="copy" readonly value="{{ new_link.url }}" onclick="this.select()">
+</section>
+{% endif %}
+
+{% for e in events %}
+<section>
+  <h2>{{ e.name }}</h2>
+  <p class="muted">
+    Created {{ e.created_at[:10] }} ·
+    {{ "drawn" if e.drawn else "open" }} ·
+    {{ e.claimed }} / {{ e.total }} claimed ·
+    creator link: {{ "yes" if e.has_creator else "none" }}
+  </p>
+  <p class="muted">Join link: <code>{{ e.join_link }}</code></p>
+
+  {% if e.people %}
   <table>
-    <tr><th>Event</th><th>Claimed</th><th>Status</th></tr>
-    {% for e in events %}
+    <tr><th>Name</th><th>Link claimed</th><th>Match opened</th></tr>
+    {% for p in e.people %}
     <tr>
-      <td><a href="/admin/events/{{ e.id }}">{{ e.name }}</a></td>
-      <td>{{ e.claimed }} / {{ e.total }}</td>
-      <td>{{ "drawn" if e.drawn else "open" }}</td>
+      <td>{{ p.name }}</td>
+      <td>{{ "yes" if p.claimed else "no" }}</td>
+      <td>{{ "yes" if p.revealed else "no" }}</td>
     </tr>
-    {% else %}
-    <tr><td colspan="3">No events yet.</td></tr>
     {% endfor %}
   </table>
-</section>
+  {% else %}
+  <p class="muted">No participants yet.</p>
+  {% endif %}
 
-<section>
-  <h2>New event</h2>
-  <form method="post" action="/admin/events" class="inline-form">
-    <input name="name" required maxlength="100" autocomplete="off" placeholder="e.g. Office Christmas 2026">
-    <button type="submit">Create</button>
-  </form>
+  <div class="actions">
+    <form method="post" action="/super/events/{{ e.id }}/rotate-creator" class="inline" onsubmit="return confirm('Issue a new creator link? The current one will stop working.');">
+      <button type="submit" class="link">{{ "New creator link" if e.has_creator else "Create creator link" }}</button>
+    </form>
+    <form method="post" action="/super/events/{{ e.id }}/delete" class="inline" onsubmit="return confirm('Delete {{ e.name }} for good? Everyone loses their links.');">
+      <button type="submit" class="link">Delete event</button>
+    </form>
+  </div>
 </section>
+{% else %}
+<section>
+  <p class="muted">No events yet.</p>
+</section>
+{% endfor %}
 {% endblock %}

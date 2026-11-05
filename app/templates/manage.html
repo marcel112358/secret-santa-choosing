@@ -1,12 +1,11 @@
 {% extends "base.html" %}
 {% block title %}{{ event.name }} · Secret Santa{% endblock %}
 {% block content %}
-<p class="muted">
-  <a href="/admin">All events</a> ·
-  <form method="post" action="/admin/logout" class="inline"><button class="link">Log out</button></form>
-</p>
+<p class="muted"><a href="/">Home</a></p>
 
 <h2>{{ event.name }}</h2>
+
+<p class="warning"><strong>Keep this page's link private.</strong> It is the only way to manage this event, and anyone who has it can change it. Bookmark it now.</p>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -32,7 +31,7 @@
       <td>{{ "yes" if p.revealed else "no" }}</td>
       <td>
         {% if p.claimed and not event.drawn %}
-        <form method="post" action="/admin/events/{{ event.id }}/participants/{{ p.id }}/unclaim" class="inline" onsubmit="return confirm('Unclaim this person? Their current link will stop working.');">
+        <form method="post" action="/manage/{{ token }}/participants/{{ p.id }}/unclaim" class="inline" onsubmit="return confirm('Unclaim this person? Their current link will stop working.');">
           <button type="submit" class="link">Unclaim</button>
         </form>
         {% endif %}
@@ -47,7 +46,7 @@
 {% if not event.drawn %}
 <section>
   <h2>Add participant</h2>
-  <form method="post" action="/admin/events/{{ event.id }}/participants" class="inline-form">
+  <form method="post" action="/manage/{{ token }}/participants" class="inline-form">
     <input name="name" required maxlength="100" autocomplete="off" placeholder="Name">
     <button type="submit">Add</button>
   </form>
@@ -56,7 +55,7 @@
 <section>
   <h2>Draw</h2>
   <p class="muted">Needs at least {{ min_participants }} participants, and everyone must claim their link first.</p>
-  <form method="post" action="/admin/events/{{ event.id }}/draw">
+  <form method="post" action="/manage/{{ token }}/draw">
     <button type="submit" {% if not can_draw %}disabled{% endif %}>Run the draw</button>
   </form>
 </section>
@@ -72,7 +71,7 @@
       <td>{{ c.a_name }} &amp; {{ c.b_name }}</td>
       <td>
         {% if not event.drawn %}
-        <form method="post" action="/admin/events/{{ event.id }}/couples/remove" class="inline">
+        <form method="post" action="/manage/{{ token }}/couples/remove" class="inline">
           <input type="hidden" name="person_a" value="{{ c.a_id }}">
           <input type="hidden" name="person_b" value="{{ c.b_id }}">
           <button type="submit" class="link">Remove</button>
@@ -87,7 +86,7 @@
   {% endif %}
 
   {% if not event.drawn and people|length >= 2 %}
-  <form method="post" action="/admin/events/{{ event.id }}/couples" class="inline-form">
+  <form method="post" action="/manage/{{ token }}/couples" class="inline-form">
     <select name="person_a" required>
       {% for p in people %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}
     </select>
@@ -102,8 +101,16 @@
 <section>
   <h2>Reset</h2>
   <p class="muted">Deletes this event's draw and every claimed link. Everyone must claim again.</p>
-  <form method="post" action="/admin/events/{{ event.id }}/reset" onsubmit="return confirm('Delete the draw and all links for this event?');">
+  <form method="post" action="/manage/{{ token }}/reset" onsubmit="return confirm('Delete the draw and all links for this event?');">
     <button type="submit" class="danger">Reset this event</button>
+  </form>
+</section>
+
+<section>
+  <h2>Delete event</h2>
+  <p class="muted">Permanently deletes this event with all its participants and matches. This can't be undone.</p>
+  <form method="post" action="/manage/{{ token }}/delete" onsubmit="return confirm('Delete this event for good? Everyone loses their links.');">
+    <button type="submit" class="danger">Delete this event</button>
   </form>
 </section>
 {% endblock %}
